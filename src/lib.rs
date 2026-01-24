@@ -1,3 +1,6 @@
+// High-throughput parsing and aggregation for the 1B rows challenge.
+// The design favors minimal allocations, predictable memory access,
+// and SIMD-like bit tricks to scan delimiters and numbers quickly.
 use std::cmp::Ordering as CmpOrd;
 use std::ffi::c_void;
 use std::fs::File;
@@ -8,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 unsafe extern "C" {
+    // POSIX mmap/munmap/madvise are used to map the input file directly into
+    // memory, avoiding read syscalls and enabling tight pointer-based loops.
     fn mmap(
         addr: *mut c_void,
         length: usize,
@@ -20,16 +25,21 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, length: usize, advice: i32) -> i32;
 }
 
+// mmap/madvise constants for a read-only sequential scan.
 const PROT_READ: i32 = 0x1;
 const MAP_PRIVATE: i32 = 0x2;
 const MAP_FAILED: *mut c_void = !0 as *mut c_void;
 const MADV_SEQUENTIAL: i32 = 2;
 
+// Fixed sizes chosen for cache-friendly hashing and to match typical dataset
+// characteristics. Power-of-two sizes allow fast masking instead of modulo.
 const SEGMENT_SIZE: usize = 1 << 21;
 const HASH_TABLE_SIZE: usize = 1 << 17;
 const MERGE_TABLE_SIZE: usize = 1 << 17;
 const PROBE_STEP: usize = 1;
 
+// Byte masks used to zero out unused bytes in the first two 64-bit words
+// of a station name, enabling fast equality checks for short names.
 const MASK1: [u64; 9] = [
     0x0000_0000_0000_00FF,
     0x0000_0000_0000_FFFF,
@@ -42,6 +52,8 @@ const MASK1: [u64; 9] = [
     0xFFFF_FFFF_FFFF_FFFF,
 ];
 
+// Secondary mask used when the name length spills beyond 8 bytes to
+// conditionally include the second word in the hash.
 const MASK2: [u64; 9] = [
     0,
     0,
@@ -61,6 +73,8 @@ struct MappedFile {
 }
 
 impl MappedFile {
+    // Memory-map the input file for zero-copy scanning. The mapping is
+    // read-only and private, so it shares the kernel page cache safely.
     fn open(path: &str) -> io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
@@ -80,6 +94,7 @@ impl MappedFile {
         if ptr == MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        // Hint that we'll read sequentially to improve readahead behavior.
         unsafe {
             let _ = madvise(ptr, len, MADV_SEQUENTIAL);
         }
@@ -102,6 +117,7 @@ impl MappedFile {
 
 impl Drop for MappedFile {
     fn drop(&mut self) {
+        // Unmap on drop to release address space; kernel handles page cache.
         if !self.ptr.is_null() && self.len > 0 {
             unsafe {
                 munmap(self.ptr as *mut c_void, self.len);
@@ -113,8 +129,11 @@ impl Drop for MappedFile {
 #[derive(Clone, Copy)]
 #[derive(Default)]
 struct Entry {
+    // Two 64-bit words store up to 16 bytes of the station name for
+    // quick comparisons (most names are short enough).
     first_word: u64,
     second_word: u64,
+    // Aggregate metrics in tenths of degrees (per 1B row spec).
     sum: i64,
     name_off: u32,
     count: u32,
@@ -131,6 +150,7 @@ struct Scanner {
 }
 
 impl Scanner {
+    // Scanner is a lightweight cursor over a byte slice in the mmap.
     #[inline(always)]
     fn new(base: *const u8, start: usize, end: usize) -> Self {
         Self { pos: start, end, base }
@@ -159,12 +179,16 @@ impl Scanner {
 
 #[inline(always)]
 fn find_delim(word: u64, byte: u8) -> u64 {
+    // "SIMD within a register": detect matching bytes in a 64-bit word.
+    // Classic trick: x ^ byte, subtract 0x01 per byte, then mask high bits.
     let input = word ^ u64::from_ne_bytes([byte; 8]);
     (input.wrapping_sub(0x0101_0101_0101_0101) & !input) & 0x8080_8080_8080_8080
 }
 
 #[inline(always)]
 fn next_newline(mut pos: usize, file_end: usize, base: *const u8) -> usize {
+    // Fast-forward to the next '\n' using word-at-a-time scanning, then
+    // finish with a byte loop for the tail.
     while pos + 8 <= file_end {
         let word = unsafe { ptr::read_unaligned(base.add(pos) as *const u64) };
         let m = find_delim(word, b'\n');
@@ -186,12 +210,15 @@ fn next_newline(mut pos: usize, file_end: usize, base: *const u8) -> usize {
 
 #[inline(always)]
 fn hash_to_index_sized(hash: u64, mask: usize) -> usize {
+    // Mix the hash with shifts to spread entropy, then mask to table size.
     let h = hash ^ (hash >> 33) ^ (hash >> 15);
     (h as usize) & mask
 }
 
 #[inline(always)]
 fn convert_into_number(decimal_sep_pos: u32, number_word: u64) -> i32 {
+    // Parse a signed decimal with one fractional digit from a 64-bit window.
+    // The algorithm uses bit shifts and a multiplication trick to avoid loops.
     let shift = 28i32 - decimal_sep_pos as i32;
     let signed = ((!number_word) << 59) as i64 >> 63 ;
     let design_mask = !((signed as u64) & 0xFF);
@@ -203,6 +230,7 @@ fn convert_into_number(decimal_sep_pos: u32, number_word: u64) -> i32 {
 
 #[inline(always)]
 fn scan_number(scanner: &mut Scanner) -> i32 {
+    // Expect numbers as ";-12.3" or ";4.5": the first byte is ';'.
     let number_word = unsafe { scanner.get_u64_at(scanner.pos + 1) };
     let decimal_sep_pos = (!(number_word) & 0x1010_1000u64).trailing_zeros() ;
     let number = convert_into_number(decimal_sep_pos, number_word);
@@ -212,6 +240,7 @@ fn scan_number(scanner: &mut Scanner) -> i32 {
 
 #[inline(always)]
 unsafe fn name_eq(base: *const u8, off_a: usize, off_b: usize, len_plus1: usize) -> bool {
+    // Compare two names including the trailing ';' to avoid bounds checks.
     let mut i = 0usize;
     while i + 8 <= len_plus1 {
         let wa = unsafe { ptr::read_unaligned(base.add(off_a + i) as *const u64) };
@@ -233,6 +262,7 @@ unsafe fn name_eq(base: *const u8, off_a: usize, off_b: usize, len_plus1: usize)
 
 #[inline(always)]
 fn record(entry: &mut Entry, number: i32) {
+    // Update min/max/sum/count in-place; uses i16 for min/max as tenths fit.
     let num = number as i16;
     if entry.count == 0 {
         entry.min = num;
@@ -259,6 +289,8 @@ unsafe fn hash_from_parts(
     first: u64,
     second: u64,
 ) -> u64 {
+    // Hash station name by XORing 64-bit chunks; short names reuse cached
+    // first/second words to avoid extra reads.
     let total_len = name_len + 1; // include ';'
     let mut hash = first ^ second;
     if total_len <= 16 {
@@ -285,6 +317,7 @@ unsafe fn hash_from_parts(
 
 #[derive(Clone, Copy)]
 struct Agg {
+    // Aggregated record used for merging and final output formatting.
     hash: u64,
     first_word: u64,
     second_word: u64,
@@ -298,6 +331,7 @@ struct Agg {
 
 #[inline(always)]
 fn new_entry(scanner: &Scanner, table: &mut [Entry], used: &mut Vec<u32>, idx: usize, name_addr: usize, name_len: usize) -> usize {
+    // Initialize a new hash-table entry and cache up to 16 bytes of the name.
     let total_len = name_len + 1;
     let mut first = unsafe { scanner.get_u64_at(name_addr) };
     let mut second = unsafe { scanner.get_u64_at(name_addr + 8) };
@@ -331,6 +365,8 @@ fn find_result(
     table: &mut [Entry],
     used: &mut Vec<u32>,
 ) -> usize {
+    // Find or insert the station entry for the current name. Fast path handles
+    // names that fit within the first 16 bytes; otherwise hash over the rest.
     let name_addr = scanner.pos;
 
     let mut hash: u64;
@@ -339,6 +375,7 @@ fn find_result(
     let mut fast16 = false;
 
     if (delim_mask | delim_mask_b) != 0 {
+        // Name ends within the first 16 bytes; compute hash and advance cursor.
         let lc1 = (delim_mask.trailing_zeros() as usize) >> 3;
         let lc2 = (delim_mask_b.trailing_zeros() as usize) >> 3;
         let mask = MASK2[lc1];
@@ -350,6 +387,7 @@ fn find_result(
         scanner.add(lc1 + (((lc2 as u64) & mask) as usize));
         fast16 = true;
     } else {
+        // Slow path: hash 8 bytes at a time until we find the ';' delimiter.
         hash = word ^ word_b;
         scanner.add(16);
         loop {
@@ -379,6 +417,7 @@ fn find_result(
         }
 
         if fast16 {
+            // Compare cached words for short names (most cases).
             if entry.first_word == first_word && entry.second_word == second_word {
                 return idx;
             }
@@ -394,6 +433,8 @@ fn find_result(
 
 #[inline(always)]
 fn parse_segment(base: *const u8, seg_start: usize, seg_end_nl: usize, table: &mut [Entry], used: &mut Vec<u32>) {
+    // Parse a segment of the mmap. We split it into three sub-scanners to
+    // interleave work and improve instruction-level parallelism.
     if seg_start >= seg_end_nl {
         return;
     }
@@ -408,6 +449,7 @@ fn parse_segment(base: *const u8, seg_start: usize, seg_end_nl: usize, table: &m
 
     while s1.has_next() && s2.has_next() && s3.has_next() {
         unsafe {
+            // Process three lines per loop using three scanners to hide latency.
             let w1 = s1.get_u64();
             let w2 = s2.get_u64();
             let w3 = s3.get_u64();
@@ -471,6 +513,7 @@ fn parse_segment(base: *const u8, seg_start: usize, seg_end_nl: usize, table: &m
 }
 
 fn cmp_name_bytes(base: *const u8, a: &Agg, b: &Agg) -> CmpOrd {
+    // Compare names lexicographically by borrowing byte slices from the mmap.
     let ap = unsafe { std::slice::from_raw_parts(base.add(a.name_off as usize), a.name_len as usize) };
     let bp = unsafe { std::slice::from_raw_parts(base.add(b.name_off as usize), b.name_len as usize) };
     ap.cmp(bp)
@@ -478,6 +521,7 @@ fn cmp_name_bytes(base: *const u8, a: &Agg, b: &Agg) -> CmpOrd {
 
 #[inline(always)]
 fn push_u64(mut n: u64, out: &mut Vec<u8>) {
+    // Manual integer formatting to avoid allocation-heavy format! macros.
     let mut tmp = [0u8; 20];
     let mut i = tmp.len();
     if n == 0 {
@@ -496,6 +540,7 @@ fn push_u64(mut n: u64, out: &mut Vec<u8>) {
 
 #[inline(always)]
 fn push_tenths_i64(val: i64, out: &mut Vec<u8>) {
+    // Format a value in tenths with a single decimal place.
     let negative = val < 0;
     let mut abs = if negative { -val } else { val } as u64;
     let frac = (abs % 10) as u8;
@@ -510,6 +555,7 @@ fn push_tenths_i64(val: i64, out: &mut Vec<u8>) {
 
 #[inline(always)]
 fn push_tenths_i16(val: i16, out: &mut Vec<u8>) {
+    // Convenience wrapper for min/max values stored as i16.
     push_tenths_i64(val as i64, out);
 }
 
@@ -521,15 +567,22 @@ pub struct WorkerResult {
 }
 
 pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
+    // End-to-end worker pipeline:
+    // - mmap file
+    // - parallel segment parsing with per-thread hash tables
+    // - merge into a single table
+    // - optionally format output
     let mapped = MappedFile::open(path)?;
     let base = mapped.as_ptr() as usize;
     let file_end = mapped.len();
 
+    // Use available hardware threads to parallelize parsing.
     let threads = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .max(1);
 
+    // Work-stealing cursor: each thread claims a fixed-size segment.
     let cursor = AtomicUsize::new(0);
 
     let thread_results = thread::scope(|scope| {
@@ -542,6 +595,8 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
                 let mut used: Vec<u32> = Vec::with_capacity(10_000);
 
                 loop {
+                    // Claim next segment; relaxed ordering is sufficient because
+                    // segments are independent and only need unique indices.
                     let current = cursor.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     if current >= file_end {
                         break;
@@ -560,6 +615,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
                     parse_segment(base_ptr, seg_start, seg_end_nl, &mut table, &mut used);
                 }
 
+                // Convert sparse hash table into a compact vector of aggregates.
                 let mut out = Vec::with_capacity(used.len());
                 for &idx in &used {
                     let e = unsafe { table.get_unchecked(idx as usize) };
@@ -610,6 +666,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
             loop {
                 let entry = unsafe { merge_table.get_unchecked_mut(idx) };
                 if entry.name_len == 0 {
+                    // Empty slot: take ownership of the aggregate.
                     entry.first_word = agg.first_word;
                     entry.second_word = agg.second_word;
                     entry.name_off = agg.name_off;
@@ -626,6 +683,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
                     && entry.first_word == agg.first_word
                     && entry.second_word == agg.second_word
                 {
+                    // Name matches; merge statistics.
                     let name_len = agg.name_len as usize;
                     let ok = if name_len < 16 {
                         true
@@ -661,6 +719,8 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
     let mut checksum: u64 = 0;
 
     if no_output {
+        // Fast path for benchmarking: compute a checksum to prevent dead-code
+        // elimination and verify deterministic aggregation.
         for idx in &merge_used {
             let e = unsafe { merge_table.get_unchecked(*idx as usize) };
             checksum ^= (e.sum as u64)
@@ -675,6 +735,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
         });
     }
 
+    // Build a list of merged entries and sort by station name.
     let mut merged: Vec<Agg> = Vec::with_capacity(merge_used.len());
     for idx in merge_used {
         let e = unsafe { merge_table.get_unchecked(idx as usize) };
@@ -696,6 +757,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
 
     merged.sort_by(|a, b| cmp_name_bytes(base_ptr, a, b));
 
+    // Format output as "{name=min/avg/max, ...}" into a byte buffer.
     let mut output: Vec<u8> = Vec::with_capacity(merged.len() * 40);
     output.push(b'{');
     for (i, a) in merged.iter().enumerate() {
@@ -707,6 +769,7 @@ pub fn run_worker(path: &str, no_output: bool) -> io::Result<WorkerResult> {
         let sum = a.sum;
         let count = a.count as i64;
         let half = count / 2;
+        // Round to nearest tenth; adjust for negative values to keep symmetric rounding.
         let avg_tenths = if sum >= 0 { (sum + half) / count } else { (sum - half) / count };
 
         output.extend_from_slice(name_bytes);
